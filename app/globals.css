@@ -4,10 +4,124 @@
   --font-sans: var(--font-geist-sans);
 }
 
+html {
+  background: #f0f0f0;
+}
+
 body {
-  background: #ffffff;
-  color: #171717;
+  background: linear-gradient(#f2f2f2, #edf8ff);
+  color: #0a0a0a;
   font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
+}
+
+@layer components {
+  /*
+   * "Liquid metal" finish, matched to the SideShift app: a banded silver gradient
+   * shows as a 1px edge around a solid inner fill that carries faint sheen streaks.
+   * The streaks slide across on hover.
+   */
+  .metal,
+  .metal-light {
+    position: relative;
+    isolation: isolate;
+    border-radius: 12px;
+    transition: transform 0.15s ease-out, filter 0.15s;
+  }
+
+  .metal::before,
+  .metal-light::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -2;
+    border-radius: inherit;
+  }
+
+  .metal::after,
+  .metal-light::after {
+    content: "";
+    position: absolute;
+    inset: 1px;
+    z-index: -1;
+    border-radius: inherit;
+    background-size: 220% 100%, 100% 100%;
+    background-position: 0% 0%, 0 0;
+    transition: background-position 0.7s ease;
+  }
+
+  .metal:hover::after,
+  .metal-light:hover::after {
+    background-position: 100% 0%, 0 0;
+  }
+
+  .metal:active,
+  .metal-light:active {
+    transform: scale(0.98);
+  }
+
+  .metal:disabled,
+  .metal-light:disabled {
+    filter: grayscale(1) opacity(0.5);
+    transform: none;
+  }
+
+  /* Dark: black fill, used for the main action on a screen. */
+  .metal {
+    color: #ffffffe6;
+  }
+
+  /* Text with a soft highlight running through it. Goes on a span inside a .metal button,
+     because the button's own background sits underneath its metal layers. */
+  .metal-text {
+    color: transparent;
+    background-image: linear-gradient(270deg, #fff0 0%, #ffffff4d 50%, #fff0 100%),
+      linear-gradient(90deg, #ffffffe6, #ffffffe6);
+    background-clip: text;
+    -webkit-background-clip: text;
+  }
+
+  .metal::before {
+    background: linear-gradient(110deg, #4c4c4c 0%, #b8b8b8 25%, #727272 50%, #b8b8b8 75%, #3f3f3f 100%);
+    box-shadow: 0 2px 3px #0000003d;
+  }
+
+  .metal::after {
+    background-image: linear-gradient(103deg, #fff0 0%, #ffffff24 25%, #fff0 50%, #ffffff24 75%, #fff0 100%),
+      linear-gradient(90deg, #000, #000);
+  }
+
+  /* Light: white fill with a silver edge, used for secondary actions and icon tiles. */
+  .metal-light {
+    color: #202020;
+  }
+
+  .metal-light::before {
+    background: linear-gradient(110deg, #959aa3 0%, #fff 25%, #bdc0c6 50%, #fff 75%, #a3a7af 100%);
+    box-shadow: 0 2px 3px #68656529;
+  }
+
+  .metal-light::after {
+    background-image: linear-gradient(103deg, #fff0 0%, #ffffff 25%, #fff0 50%, #ffffff 75%, #fff0 100%),
+      linear-gradient(180deg, #ffffff, #f6f7f9);
+  }
+
+  /* The blue card with dark sheen bands. */
+  .metal-blue {
+    color: #fff;
+    border-radius: 16px;
+    border: 0.8px solid #7070701f;
+    background: linear-gradient(96deg, #0000 0%, #0003 25%, #0000 50%, #0003 75%, #0000 100%),
+      radial-gradient(73.64% 135.8% at 78% 36%, #3b85ff 0%, #3c83f9 100%);
+    box-shadow: 0 12px 30px -8px #3b85ff66;
+  }
+
+  /* Plain stat card. */
+  .panel {
+    border-radius: 16px;
+    border: 0.8px solid #7070701f;
+    background: #ffffffcc;
+    box-shadow: 0 2px 3px #6865650a;
+  }
 }
 
 /* Cards slide up into place, tilted, when a new round starts. */
@@ -33,6 +147,17 @@ body {
   }
 }
 
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
 .card-in {
   animation: card-in 0.6s cubic-bezier(0.2, 0.9, 0.3, 1.1) both;
 }
@@ -41,9 +166,14 @@ body {
   animation: card-float 6s ease-in-out infinite;
 }
 
+.pop-in {
+  animation: pop-in 0.35s cubic-bezier(0.2, 0.9, 0.3, 1.1) both;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .card-in,
-  .card-float {
+  .card-float,
+  .pop-in {
     animation: none;
   }
 }
