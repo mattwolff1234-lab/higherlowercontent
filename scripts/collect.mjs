@@ -2,7 +2,7 @@
 // we don't want, and only then download the video files that are left.
 // Run with: node --env-file=.env.local scripts/collect.mjs
 import { execFileSync } from 'node:child_process';
-import { existsSync, renameSync } from 'node:fs';
+import { existsSync, renameSync, unlinkSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 
 const TOKEN = process.env.APIFY_TOKEN;
@@ -82,11 +82,27 @@ async function runActor(actor, input) {
   return (await fetchRetry(`${API}/datasets/${run.defaultDatasetId}/items?token=${TOKEN}`)).json();
 }
 
-async function download(url, file) {
+async function download(url, file, audioUrl) {
   const res = await fetchRetry(url);
   if (!res.ok) return false;
   await writeFile(`${VIDEO_DIR}/${file}`, Buffer.from(await res.arrayBuffer()));
+  if (audioUrl && !(await addMissingAudio(`${VIDEO_DIR}/${file}`, audioUrl))) return false;
   trimToMax(`${VIDEO_DIR}/${file}`);
+  return true;
+}
+
+// Instagram sometimes serves the picture and the sound as separate files, so join them.
+async function addMissingAudio(path, audioUrl) {
+  const streams = execFileSync('ffprobe', ['-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=index', '-of', 'csv=p=0', path]);
+  if (String(streams).trim()) return true;
+  const res = await fetchRetry(audioUrl);
+  if (!res.ok) return false;
+  const audio = `${path}.audio.mp4`;
+  const tmp = `${path}.tmp.mp4`;
+  await writeFile(audio, Buffer.from(await res.arrayBuffer()));
+  execFileSync('ffmpeg', ['-loglevel', 'error', '-y', '-i', path, '-i', audio, '-map', '0:v', '-map', '1:a', '-c', 'copy', '-shortest', '-movflags', '+faststart', tmp]);
+  renameSync(tmp, path);
+  unlinkSync(audio);
   return true;
 }
 
@@ -230,7 +246,7 @@ async function collectInstagram(known) {
   // Instagram's file links expire quickly, so grab the files before the slower follower lookup.
   const saved = [];
   for (const v of keep) {
-    if (await download(v.videoUrl, `instagram-${v.shortCode}.mp4`)) saved.push(v);
+    if (await download(v.videoUrl, `instagram-${v.shortCode}.mp4`, v.audioUrl)) saved.push(v);
   }
 
   const profiles = await runActor('apify~instagram-profile-scraper', {

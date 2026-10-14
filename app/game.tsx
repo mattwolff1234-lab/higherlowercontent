@@ -49,8 +49,8 @@ const PLATFORM = {
 const SIDES: Side[] = ["a", "b"];
 const other = (side: Side): Side => (side === "a" ? "b" : "a");
 
-// Each video gets at most this long before the other one takes over.
-const CLIP_SECONDS = 15;
+// At the start of a round each video plays this long, then the other takes over once.
+const PREVIEW_SECONDS = 6.5;
 // How far a card leans toward the mouse, in degrees.
 const MAX_TILT = 10;
 
@@ -61,6 +61,8 @@ export default function Game() {
   const [streak, setStreak] = useState(0);
   // Only one video plays at a time, with sound; the other waits paused.
   const [active, setActive] = useState<Side>("a");
+  // True until both videos have had their preview or the player switches by hand.
+  const [previewing, setPreviewing] = useState(true);
   // Browsers block sound until the page has been tapped or a key pressed.
   const [soundAllowed, setSoundAllowed] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -80,6 +82,7 @@ export default function Game() {
     seen.current.push(data.pair.a.id, data.pair.b.id);
     setPair(data.pair);
     setActive("a");
+    setPreviewing(true);
     setResult(null);
     setPicked(null);
     setBusy(false);
@@ -109,7 +112,9 @@ export default function Game() {
       // Stop the space bar from also pressing whichever button has focus.
       e.preventDefault();
       (document.activeElement as HTMLElement | null)?.blur();
-      if (!e.repeat) setActive(other);
+      if (e.repeat) return;
+      setActive(other);
+      setPreviewing(false);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -195,7 +200,12 @@ export default function Game() {
                     playing={active === side && !funnelOpen}
                     soundAllowed={soundAllowed}
                     floatDelay={side === "a" ? "0s" : "-3s"}
-                    onTap={() => setActive(active === side ? other(side) : side)}
+                    preview={previewing}
+                    onTap={() => {
+                      setActive(active === side ? other(side) : side);
+                      setPreviewing(false);
+                    }}
+                    onPreviewEnd={() => (side === "a" ? setActive("b") : setPreviewing(false))}
                     onEnded={() => setActive(other(side))}
                     onPick={() => guess(side)}
                   />
@@ -381,7 +391,9 @@ function Card({
   playing,
   soundAllowed,
   floatDelay,
+  preview,
   onTap,
+  onPreviewEnd,
   onEnded,
   onPick,
 }: {
@@ -394,7 +406,9 @@ function Card({
   playing: boolean;
   soundAllowed: boolean;
   floatDelay: string;
+  preview: boolean;
   onTap: () => void;
+  onPreviewEnd: () => void;
   onEnded: () => void;
   onPick: () => void;
 }) {
@@ -420,12 +434,9 @@ function Card({
 
   function handleTime() {
     const el = videoRef.current!;
-    const clip = Math.min(CLIP_SECONDS, el.duration || CLIP_SECONDS);
-    setProgress(Math.min(el.currentTime / clip, 1));
-    if (el.currentTime >= CLIP_SECONDS) {
-      el.currentTime = 0;
-      onEnded();
-    }
+    const length = preview ? PREVIEW_SECONDS : el.duration;
+    setProgress(Math.min(el.currentTime / length, 1));
+    if (preview && el.currentTime >= PREVIEW_SECONDS) onPreviewEnd();
   }
 
   function tilt(e: React.PointerEvent<HTMLDivElement>) {
@@ -446,7 +457,7 @@ function Card({
 
   return (
     <section className="flex min-h-0 flex-1 items-center gap-4 px-4 py-3 md:flex-none md:flex-col md:gap-7 md:p-0">
-      <div className="card-in h-full shrink-0 md:h-[min(46vh,470px)]" style={{ perspective: "1000px" }}>
+      <div className="card-in h-full shrink-0 md:h-[min(53vh,550px)]" style={{ perspective: "1000px" }}>
         <div className="card-float h-full" style={{ animationDelay: floatDelay }}>
           <div
             ref={tiltRef}
