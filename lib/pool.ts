@@ -35,9 +35,12 @@ const farApart = (a: Video, b: Video) =>
   ratio(a.views, b.views) >= MIN_RATIO &&
   ratio(a.followers, b.followers) <= MAX_FOLLOWER_RATIO;
 
+// The live site serves video files from Cloudflare; locally they come from public/videos.
+const VIDEO_HOST = process.env.VIDEO_HOST ?? "";
+
 function toPublic(video: Video): PublicVideo {
   const { id, platform, handle, followers, videoUrl } = video;
-  return { id, platform, handle, followers, videoUrl };
+  return { id, platform, handle, followers, videoUrl: VIDEO_HOST + videoUrl };
 }
 
 function shuffle<T>(items: T[]) {
