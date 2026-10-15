@@ -47,12 +47,15 @@ const API = 'https://api.apify.com/v2';
 let spent = 0;
 
 // Optional: "node scripts/collect.mjs creators" or "... brands" collects only that group.
+// "node scripts/collect.mjs posts <url> <url> ..." adds those exact posts and skips the filters.
 const only = process.argv[2];
+const posts = only === 'posts' ? process.argv.slice(3) : [];
 // Optional second word: "tiktok" or "instagram" collects from only that platform.
 const platform = process.argv[3];
-const brands = only === 'creators' ? [] : [...BRANDS, ...TOPICS];
+const brands = only === 'creators' || posts.length ? [] : [...BRANDS, ...TOPICS];
 // Any handles after that collect only those creators, e.g. "creators instagram bitterbuilds".
-const creators = only === 'brands' ? [] : process.argv.length > 4 ? process.argv.slice(4) : CREATORS;
+const creators =
+  only === 'brands' || posts.length ? [] : process.argv.length > 4 ? process.argv.slice(4) : CREATORS;
 
 // Long runs hit the odd dropped connection, so retry a few times before giving up.
 async function fetchRetry(url, options, tries = 3) {
@@ -182,12 +185,12 @@ async function collectTikTok(known) {
   );
   report(found, keep, (v) => v.input);
   console.log(`TikTok: found ${found.length}, kept ${keep.length} after filtering`);
-  if (!keep.length) return [];
+  return saveTikTok(keep.map((v) => v.webVideoUrl));
+}
 
-  const withFiles = await runActor('clockworks~tiktok-scraper', {
-    postURLs: keep.map((v) => v.webVideoUrl),
-    shouldDownloadVideos: true,
-  });
+async function saveTikTok(postURLs) {
+  if (!postURLs.length) return [];
+  const withFiles = await runActor('clockworks~tiktok-scraper', { postURLs, shouldDownloadVideos: true });
   const out = [];
   for (const v of withFiles) {
     const id = `tiktok-${v.id}`;
@@ -241,6 +244,10 @@ async function collectInstagram(known) {
   );
   report(found, keep, (v) => v.inputUrl);
   console.log(`Instagram: found ${found.length}, kept ${keep.length} after filtering`);
+  return saveInstagram(keep);
+}
+
+async function saveInstagram(keep) {
   if (!keep.length) return [];
 
   // Instagram's file links expire quickly, so grab the files before the slower follower lookup.
@@ -275,10 +282,23 @@ const existing = JSON.parse(await readFile(POOL_FILE, 'utf8')).filter((v) =>
 const known = new Set(existing.map((v) => v.id));
 for (const v of existing) creatorCounts.set(v.handle, (creatorCounts.get(v.handle) ?? 0) + 1);
 
-const added = [
-  ...(platform === 'instagram' ? [] : await collectTikTok(known)),
-  ...(platform === 'tiktok' ? [] : await collectInstagram(known)),
-];
+const isTikTok = (url) => /tiktok\.com/.test(url);
+const added = posts.length
+  ? [
+      ...(await saveTikTok(posts.filter(isTikTok))),
+      ...(await saveInstagram(
+        posts.some((url) => !isTikTok(url))
+          ? await runActor('apify~instagram-scraper', {
+              directUrls: posts.filter((url) => !isTikTok(url)),
+              resultsType: 'posts',
+            }).then((items) => items.filter((v) => v.videoUrl))
+          : [],
+      )),
+    ].filter((v) => !known.has(v.id))
+  : [
+      ...(platform === 'instagram' ? [] : await collectTikTok(known)),
+      ...(platform === 'tiktok' ? [] : await collectInstagram(known)),
+    ];
 await writeFile(POOL_FILE, JSON.stringify([...existing, ...added], null, 2) + '\n');
 
 console.log(`\nAdded ${added.length} videos. Pool now has ${existing.length + added.length}.`);
