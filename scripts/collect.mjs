@@ -4,8 +4,8 @@
 //
 // Pull one creator's most-viewed videos by scanning deep into their profile:
 //   node --env-file=.env.local scripts/collect.mjs creators instagram hector.serrrano --depth=200 --max=15
-// Add specific reels by link, one per line in a text file. This is the only way to get
-// trial reels that were never shared to the profile, since Instagram hides those from it:
+// Only recent posts: --since=2026-07-15. Save everything scanned for analysis: --save-scan=scan.json
+// Add specific reels by link, one per line in a text file (they skip the view, language and cap filters):
 //   node --env-file=.env.local scripts/collect.mjs creators instagram hector.serrrano --depth=200 --urls=reels.txt
 //   node --env-file=.env.local scripts/collect.mjs urls --urls=reels.txt
 import { execFileSync } from 'node:child_process';
@@ -43,6 +43,8 @@ const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
 const VIDEOS_PER_CREATOR = Number(flags.depth ?? 15);
 // Stops one prolific creator from filling the pool. Counts videos already in the pool.
 const MAX_PER_CREATOR = Number(flags.max ?? 8);
+// Only look at posts after this date (YYYY-MM-DD), for a read on what's trending now.
+const SINCE = flags.since;
 
 const MIN_SECONDS = 7;
 // Longer videos are kept but cut down to this length.
@@ -60,6 +62,8 @@ const MIN_AGE_DAYS = 14;
 const VIDEO_DIR = 'public/videos';
 const POOL_FILE = 'data/videos.json';
 const API = 'https://api.apify.com/v2';
+// Sent as a header so the token never shows up in logged URLs.
+const AUTH = { authorization: `Bearer ${TOKEN}` };
 
 let spent = 0;
 
@@ -96,23 +100,39 @@ async function fetchRetry(url, options, tries = 3) {
 }
 
 async function runActor(actor, input) {
-  const post = await fetchRetry(`${API}/acts/${actor}/runs?token=${TOKEN}`, {
+  const post = await fetchRetry(`${API}/acts/${actor}/runs`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { ...AUTH, 'content-type': 'application/json' },
     body: JSON.stringify(input),
   });
   if (!post.ok) throw new Error(`${actor} would not start: ${post.status} ${await post.text()}`);
   let run = (await post.json()).data;
+  console.log(`  ${actor} run ${run.id} started`);
   while (run.status === 'READY' || run.status === 'RUNNING') {
-    run = (await (await fetchRetry(`${API}/actor-runs/${run.id}?token=${TOKEN}&waitForFinish=60`)).json()).data;
+    run = (await getJson(`${API}/actor-runs/${run.id}?waitForFinish=20`)).data;
   }
   if (run.status !== 'SUCCEEDED') throw new Error(`${actor} ended as ${run.status}`);
   spent += run.usageTotalUsd ?? 0;
-  return (await fetchRetry(`${API}/datasets/${run.defaultDatasetId}/items?token=${TOKEN}`)).json();
+  return getJson(`${API}/datasets/${run.defaultDatasetId}/items`);
+}
+
+// A proxy or network hiccup can return an error page instead of JSON, so try again.
+async function getJson(url, tries = 5) {
+  for (let i = 1; ; i++) {
+    try {
+      const res = await fetchRetry(url, { headers: AUTH });
+      if (res.ok) return await res.json();
+      if (i === tries) throw new Error(`${url} answered ${res.status}`);
+    } catch (err) {
+      if (i === tries) throw err;
+    }
+    await new Promise((r) => setTimeout(r, 3000 * i));
+  }
 }
 
 async function download(url, file, audioUrl) {
-  const res = await fetchRetry(url);
+  // Apify's own file links need the token; Instagram's don't.
+  const res = await fetchRetry(url, url.startsWith(API) ? { headers: AUTH } : undefined);
   if (!res.ok) return false;
   await writeFile(`${VIDEO_DIR}/${file}`, Buffer.from(await res.arrayBuffer()));
   if (audioUrl && !(await addMissingAudio(`${VIDEO_DIR}/${file}`, audioUrl))) return false;
@@ -151,12 +171,15 @@ const oldEnough = (date) => Date.now() - new Date(date).getTime() >= MIN_AGE_DAY
 const uniqueBy = (items, key) => [...new Map(items.map((i) => [key(i), i])).values()];
 
 // Instagram doesn't label a post's language, so judge it from the caption.
+// Creators we named are already known to post in English, so their short captions
+// ("do the work") only need to be in the Latin alphabet.
 const ENGLISH_WORDS = /\b(the|and|you|your|this|that|for|with|is|it|my|to|of|in|how|what|i)\b/g;
-function looksEnglish(caption = '') {
-  const text = caption.toLowerCase().replace(/#\S+/g, '');
+function looksEnglish(caption = '', knownCreator = false) {
+  const text = (caption ?? '').toLowerCase().replace(/#\S+/g, '');
   const letters = text.replace(/[^\p{L}]/gu, '');
   const latin = letters.replace(/[^a-z]/g, '');
-  return latin.length >= letters.length * 0.9 && (text.match(ENGLISH_WORDS) ?? []).length >= 3;
+  if (latin.length < letters.length * 0.9) return false;
+  return knownCreator || (text.match(ENGLISH_WORDS) ?? []).length >= 3;
 }
 
 // Counts across both platforms and videos already in the pool.
@@ -221,7 +244,7 @@ async function collectTikTok(known) {
   for (const v of withFiles) {
     const id = `tiktok-${v.id}`;
     const fileUrl = v.mediaUrls?.[0];
-    if (!fileUrl || !(await download(`${fileUrl}?token=${TOKEN}`, `${id}.mp4`))) continue;
+    if (!fileUrl || !(await download(fileUrl, `${id}.mp4`))) continue;
     out.push({
       id,
       platform: 'tiktok',
@@ -236,54 +259,26 @@ async function collectTikTok(known) {
   return out;
 }
 
-// Reels from the --urls file, looked up one by one.
-async function collectPicked(known, profileItems, alreadyKept) {
+// Reels from the --urls file. The reel scraper takes reel links as well as usernames.
+async function collectPicked(known, alreadyKept) {
   if (!igUrls.length) return [];
-  const items = await runActor('apify~instagram-scraper', {
-    directUrls: igUrls,
-    resultsType: 'details',
-    resultsLimit: igUrls.length,
-  });
+  const items = await runActor('apify~instagram-reel-scraper', { username: igUrls, resultsLimit: 1 });
   reportTrialFields(items);
-  const failed = items.filter((v) => v.error);
-  for (const v of failed) console.log(`  Could not load ${v.url ?? v.inputUrl}: ${v.error}`);
-  const posts = items
-    .filter((v) => !v.error)
-    .map((v) => ({ ...v, videoPlayCount: v.videoPlayCount ?? v.videoViewCount }));
-  if (posts.length && posts.every((v) => !v.videoUrl || v.videoPlayCount === undefined)) {
-    console.log(`  Reel lookups came back without video or view fields. Fields seen: ${Object.keys(posts[0]).join(', ')}`);
-  }
-
-  // A creator's profile only shows reels they shared, so a picked reel missing from a
-  // profile we just scanned is most likely a trial reel that never went to followers.
-  const scanned = new Set(creators.map((c) => c.toLowerCase()));
-  const onProfile = new Set(profileItems.map((v) => v.shortCode));
+  for (const v of items.filter((v) => v.error)) console.log(`  Could not load ${v.inputUrl ?? v.url}: ${v.error}`);
   const taken = new Set(alreadyKept.map((v) => v.shortCode));
   const keep = [];
-  for (const v of uniqueBy(posts, (p) => p.shortCode)) {
-    const label = `  ${v.url ?? v.shortCode} (@${v.ownerUsername}, ${v.videoPlayCount ?? '?'} views)`;
+  for (const v of uniqueBy(items.filter((v) => !v.error), (p) => p.shortCode)) {
     const why = known.has(`instagram-${v.shortCode}`) || taken.has(v.shortCode)
       ? 'already have it'
-      : !v.videoUrl
-        ? 'no video file (photo post or blocked)'
-        : !goodLength(v.videoDuration)
-          ? 'too short'
-          : !oldEnough(v.timestamp)
-            ? `newer than ${MIN_AGE_DAYS} days, views still climbing`
-            : v.videoPlayCount === undefined
-              ? 'no view count'
-              : '';
-    if (why) {
-      console.log(`${label}: skipped, ${why}`);
-      continue;
-    }
-    const trial = !scanned.has(v.ownerUsername?.toLowerCase())
-      ? ''
-      : onProfile.has(v.shortCode)
-        ? ', on profile'
-        : ', NOT on profile (likely trial reel)';
-    console.log(`${label}: kept${trial}`);
-    keep.push(v);
+      : !goodLength(v.videoDuration)
+        ? 'too short'
+        : !oldEnough(v.timestamp)
+          ? `newer than ${MIN_AGE_DAYS} days, views still climbing`
+          : v.videoPlayCount === undefined
+            ? 'no view count'
+            : '';
+    console.log(`  ${v.url} (@${v.ownerUsername}, ${v.videoPlayCount ?? '?'} views): ${why ? `skipped, ${why}` : 'kept'}`);
+    if (!why) keep.push(v);
   }
   console.log(`Picked reels: ${igUrls.length} links, ${keep.length} kept`);
   return keep;
@@ -320,9 +315,12 @@ async function collectInstagram(known) {
       ...(await runActor('apify~instagram-reel-scraper', {
         username: creators,
         resultsLimit: VIDEOS_PER_CREATOR,
-      })),
+        ...(SINCE && { onlyPostsNewerThan: SINCE }),
+      })).filter((v) => !v.error),
     );
   }
+  if (flags['save-scan']) await writeFile(flags['save-scan'], JSON.stringify(found, null, 2));
+  const named = new Set(creators.map((c) => c.toLowerCase()));
   const keep = capPerCreator(
     uniqueBy(found, (v) => v.shortCode).filter(
       (v) =>
@@ -330,7 +328,7 @@ async function collectInstagram(known) {
         v.videoUrl &&
         goodLength(v.videoDuration) &&
         v.videoPlayCount >= MIN_VIEWS &&
-        looksEnglish(v.caption) &&
+        looksEnglish(v.caption, named.has(v.ownerUsername?.toLowerCase())) &&
         !BLOCKED.test(`${v.caption} ${v.ownerUsername} ${v.ownerFullName}`) &&
         oldEnough(v.timestamp),
     ).sort((a, b) => b.videoPlayCount - a.videoPlayCount),
@@ -340,14 +338,23 @@ async function collectInstagram(known) {
   console.log(`Instagram: found ${found.length}, kept ${keep.length} after filtering`);
   reportTrialFields(found);
 
-  const picked = await collectPicked(known, found, keep);
+  const picked = await collectPicked(known, keep);
   const all = [...keep, ...picked];
   if (!all.length) return [];
 
-  // Instagram's file links expire quickly, so grab the files before the slower follower lookup.
+  // Apify downloads the files and hosts them itself, with sound already joined in.
+  // Instagram's own file links expire fast and can be blocked, so they're only a fallback.
+  const withFiles = await runActor('apify~instagram-reel-scraper', {
+    username: all.map((v) => `https://www.instagram.com/reel/${v.shortCode}/`),
+    resultsLimit: 1,
+    includeDownloadedVideo: true,
+  });
+  const hosted = new Map(withFiles.map((v) => [v.shortCode, v.downloadedVideo]));
   const saved = [];
   for (const v of all) {
-    if (await download(v.videoUrl, `instagram-${v.shortCode}.mp4`, v.audioUrl)) saved.push(v);
+    const file = `instagram-${v.shortCode}.mp4`;
+    const url = hosted.get(v.shortCode);
+    if (url ? await download(url, file) : await download(v.videoUrl, file, v.audioUrl)) saved.push(v);
   }
 
   const profiles = await runActor('apify~instagram-profile-scraper', {
