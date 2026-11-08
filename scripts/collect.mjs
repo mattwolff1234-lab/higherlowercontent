@@ -5,6 +5,7 @@
 // Pull one creator's most-viewed videos by scanning deep into their profile:
 //   node --env-file=.env.local scripts/collect.mjs creators instagram hector.serrrano --depth=200 --max=15
 // Only recent posts: --since=2026-07-15. Save everything scanned for analysis: --save-scan=scan.json
+// If Instagram's video servers are blocked, add --apify-download (costs about $0.10 per reel).
 // Add specific reels by link, one per line in a text file (they skip the view, language and cap filters):
 //   node --env-file=.env.local scripts/collect.mjs creators instagram hector.serrrano --depth=200 --urls=reels.txt
 //   node --env-file=.env.local scripts/collect.mjs urls --urls=reels.txt
@@ -345,13 +346,15 @@ async function collectInstagram(known) {
   const all = [...keep, ...picked];
   if (!all.length) return [];
 
-  // Apify downloads the files and hosts them itself, with sound already joined in.
-  // Instagram's own file links expire fast and can be blocked, so they're only a fallback.
-  const withFiles = await runActor('apify~instagram-reel-scraper', {
-    username: all.map((v) => `https://www.instagram.com/reel/${v.shortCode}/`),
-    resultsLimit: 1,
-    includeDownloadedVideo: true,
-  });
+  // --apify-download has Apify fetch and host the files, for networks that block Instagram.
+  // It bills $0.015 per MB (about $0.10 a reel), so by default files come straight from Instagram.
+  const withFiles = flags['apify-download']
+    ? await runActor('apify~instagram-reel-scraper', {
+        username: all.map((v) => `https://www.instagram.com/reel/${v.shortCode}/`),
+        resultsLimit: 1,
+        includeDownloadedVideo: true,
+      })
+    : [];
   const hosted = new Map(withFiles.map((v) => [v.shortCode, v.downloadedVideo]));
   const saved = [];
   for (const v of all) {
