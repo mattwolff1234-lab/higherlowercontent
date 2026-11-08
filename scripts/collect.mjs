@@ -1,6 +1,13 @@
 // Collects real videos for the game: scrape details first, throw out the ones
 // we don't want, and only then download the video files that are left.
 // Run with: node --env-file=.env.local scripts/collect.mjs
+//
+// Pull one creator's most-viewed videos by scanning deep into their profile:
+//   node --env-file=.env.local scripts/collect.mjs creators instagram hector.serrrano --depth=200 --max=15
+// Add specific reels by link, one per line in a text file. This is the only way to get
+// trial reels that were never shared to the profile, since Instagram hides those from it:
+//   node --env-file=.env.local scripts/collect.mjs creators instagram hector.serrrano --depth=200 --urls=reels.txt
+//   node --env-file=.env.local scripts/collect.mjs urls --urls=reels.txt
 import { execFileSync } from 'node:child_process';
 import { existsSync, renameSync, unlinkSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
@@ -22,10 +29,20 @@ const CREATORS = [
 const TOPICS = ['techtok', 'aitools', 'selfimprovement', 'personalgrowth', 'ugccreator', 'entrepreneurship'];
 const TIKTOKS_PER_BRAND = 10;
 const REELS_PER_BRAND = 10;
-// Creators post often, so pull more to get past the ones that are too new.
-const VIDEOS_PER_CREATOR = 15;
-// Stops one prolific creator from filling the pool.
-const MAX_PER_CREATOR = 8;
+// Optional flags like --depth=200, kept apart from the plain words.
+const flags = Object.fromEntries(
+  process.argv.slice(2).filter((a) => a.startsWith('--')).map((a) => {
+    const [k, v = 'true'] = a.slice(2).split('=');
+    return [k, v];
+  }),
+);
+const args = process.argv.slice(2).filter((a) => !a.startsWith('--'));
+
+// How far back into each creator's profile to look. Each creator's most-viewed videos are kept,
+// so a deeper scan finds their real top videos instead of just the latest ones.
+const VIDEOS_PER_CREATOR = Number(flags.depth ?? 15);
+// Stops one prolific creator from filling the pool. Counts videos already in the pool.
+const MAX_PER_CREATOR = Number(flags.max ?? 8);
 
 const MIN_SECONDS = 7;
 // Longer videos are kept but cut down to this length.
@@ -46,13 +63,25 @@ const API = 'https://api.apify.com/v2';
 
 let spent = 0;
 
-// Optional: "node scripts/collect.mjs creators" or "... brands" collects only that group.
-const only = process.argv[2];
+// Optional: "creators" or "brands" collects only that group, "urls" only the --urls file.
+const only = args[0];
 // Optional second word: "tiktok" or "instagram" collects from only that platform.
-const platform = process.argv[3];
-const brands = only === 'creators' ? [] : [...BRANDS, ...TOPICS];
+const platform = only === 'urls' ? 'instagram' : args[1];
+const brands = only === 'creators' || only === 'urls' ? [] : [...BRANDS, ...TOPICS];
 // Any handles after that collect only those creators, e.g. "creators instagram bitterbuilds".
-const creators = only === 'brands' ? [] : process.argv.length > 4 ? process.argv.slice(4) : CREATORS;
+const creators =
+  only === 'brands' || only === 'urls' ? [] : args.length > 2 ? args.slice(2) : CREATORS;
+// Hand-picked Instagram reel links. These skip the view, language and per-creator filters.
+const pickedUrls = flags.urls
+  ? (await readFile(flags.urls, 'utf8'))
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'))
+  : [];
+for (const u of pickedUrls.filter((u) => !u.includes('instagram.com'))) {
+  console.log(`Skipping ${u}: only Instagram links are supported in --urls`);
+}
+const igUrls = pickedUrls.filter((u) => u.includes('instagram.com'));
 
 // Long runs hit the odd dropped connection, so retry a few times before giving up.
 async function fetchRetry(url, options, tries = 3) {
@@ -177,7 +206,7 @@ async function collectTikTok(known) {
         v.textLanguage === 'en' &&
         !BLOCKED.test(`${v.text} ${v.authorMeta.name} ${v.authorMeta.nickName}`) &&
         oldEnough(v.createTimeISO),
-    ),
+    ).sort((a, b) => b.playCount - a.playCount),
     (v) => v.authorMeta.name,
   );
   report(found, keep, (v) => v.input);
@@ -205,6 +234,74 @@ async function collectTikTok(known) {
   }
   console.log(`TikTok: downloaded ${out.length}`);
   return out;
+}
+
+// Reels from the --urls file, looked up one by one.
+async function collectPicked(known, profileItems, alreadyKept) {
+  if (!igUrls.length) return [];
+  const items = await runActor('apify~instagram-scraper', {
+    directUrls: igUrls,
+    resultsType: 'details',
+    resultsLimit: igUrls.length,
+  });
+  reportTrialFields(items);
+  const failed = items.filter((v) => v.error);
+  for (const v of failed) console.log(`  Could not load ${v.url ?? v.inputUrl}: ${v.error}`);
+  const posts = items
+    .filter((v) => !v.error)
+    .map((v) => ({ ...v, videoPlayCount: v.videoPlayCount ?? v.videoViewCount }));
+  if (posts.length && posts.every((v) => !v.videoUrl || v.videoPlayCount === undefined)) {
+    console.log(`  Reel lookups came back without video or view fields. Fields seen: ${Object.keys(posts[0]).join(', ')}`);
+  }
+
+  // A creator's profile only shows reels they shared, so a picked reel missing from a
+  // profile we just scanned is most likely a trial reel that never went to followers.
+  const scanned = new Set(creators.map((c) => c.toLowerCase()));
+  const onProfile = new Set(profileItems.map((v) => v.shortCode));
+  const taken = new Set(alreadyKept.map((v) => v.shortCode));
+  const keep = [];
+  for (const v of uniqueBy(posts, (p) => p.shortCode)) {
+    const label = `  ${v.url ?? v.shortCode} (@${v.ownerUsername}, ${v.videoPlayCount ?? '?'} views)`;
+    const why = known.has(`instagram-${v.shortCode}`) || taken.has(v.shortCode)
+      ? 'already have it'
+      : !v.videoUrl
+        ? 'no video file (photo post or blocked)'
+        : !goodLength(v.videoDuration)
+          ? 'too short'
+          : !oldEnough(v.timestamp)
+            ? `newer than ${MIN_AGE_DAYS} days, views still climbing`
+            : v.videoPlayCount === undefined
+              ? 'no view count'
+              : '';
+    if (why) {
+      console.log(`${label}: skipped, ${why}`);
+      continue;
+    }
+    const trial = !scanned.has(v.ownerUsername?.toLowerCase())
+      ? ''
+      : onProfile.has(v.shortCode)
+        ? ', on profile'
+        : ', NOT on profile (likely trial reel)';
+    console.log(`${label}: kept${trial}`);
+    keep.push(v);
+  }
+  console.log(`Picked reels: ${igUrls.length} links, ${keep.length} kept`);
+  return keep;
+}
+
+// We don't know if Apify marks trial reels, so print any field that mentions "trial".
+function reportTrialFields(items) {
+  const seen = new Map();
+  const walk = (obj, path, depth) => {
+    if (!obj || typeof obj !== 'object' || depth > 3) return;
+    for (const [k, v] of Object.entries(obj)) {
+      const p = path ? `${path}.${k}` : k;
+      if (/trial/i.test(k)) seen.set(`${p}=${JSON.stringify(v)}`, (seen.get(`${p}=${JSON.stringify(v)}`) ?? 0) + 1);
+      walk(v, p, depth + 1);
+    }
+  };
+  for (const i of items) walk(i, '', 0);
+  for (const [field, n] of seen) console.log(`  Trial field: ${field} on ${n} items`);
 }
 
 async function collectInstagram(known) {
@@ -236,16 +333,20 @@ async function collectInstagram(known) {
         looksEnglish(v.caption) &&
         !BLOCKED.test(`${v.caption} ${v.ownerUsername} ${v.ownerFullName}`) &&
         oldEnough(v.timestamp),
-    ),
+    ).sort((a, b) => b.videoPlayCount - a.videoPlayCount),
     (v) => v.ownerUsername,
   );
   report(found, keep, (v) => v.inputUrl);
   console.log(`Instagram: found ${found.length}, kept ${keep.length} after filtering`);
-  if (!keep.length) return [];
+  reportTrialFields(found);
+
+  const picked = await collectPicked(known, found, keep);
+  const all = [...keep, ...picked];
+  if (!all.length) return [];
 
   // Instagram's file links expire quickly, so grab the files before the slower follower lookup.
   const saved = [];
-  for (const v of keep) {
+  for (const v of all) {
     if (await download(v.videoUrl, `instagram-${v.shortCode}.mp4`, v.audioUrl)) saved.push(v);
   }
 
@@ -269,9 +370,14 @@ async function collectInstagram(known) {
 }
 
 await mkdir(VIDEO_DIR, { recursive: true });
-const existing = JSON.parse(await readFile(POOL_FILE, 'utf8')).filter((v) =>
-  existsSync(`public${v.videoUrl}`),
-);
+// Deleting a video's file drops it from the pool. But if none of the files are here,
+// the videos live on R2 only, so keep the whole pool instead of wiping it.
+const pool = JSON.parse(await readFile(POOL_FILE, 'utf8'));
+const local = pool.filter((v) => existsSync(`public${v.videoUrl}`));
+if (!local.length && pool.length) {
+  console.log(`No video files in ${VIDEO_DIR}, so keeping all ${pool.length} pool entries as they are.`);
+}
+const existing = local.length ? local : pool;
 const known = new Set(existing.map((v) => v.id));
 for (const v of existing) creatorCounts.set(v.handle, (creatorCounts.get(v.handle) ?? 0) + 1);
 
