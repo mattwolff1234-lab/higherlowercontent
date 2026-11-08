@@ -132,8 +132,11 @@ async function getJson(url, tries = 5) {
 
 async function download(url, file, audioUrl) {
   // Apify's own file links need the token; Instagram's don't.
-  const res = await fetchRetry(url, url.startsWith(API) ? { headers: AUTH } : undefined);
-  if (!res.ok) return false;
+  // One video that can't be fetched shouldn't sink the whole run, so skip it.
+  const res = await fetchRetry(url, url.startsWith(API) ? { headers: AUTH } : undefined).catch((err) => {
+    console.log(`  Could not download ${file}: ${err.cause?.message ?? err.message}`);
+  });
+  if (!res?.ok) return false;
   await writeFile(`${VIDEO_DIR}/${file}`, Buffer.from(await res.arrayBuffer()));
   if (audioUrl && !(await addMissingAudio(`${VIDEO_DIR}/${file}`, audioUrl))) return false;
   trimToMax(`${VIDEO_DIR}/${file}`);
